@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Smoke test for extract_headers_and_samples.py.
+"""Smoke test for extract_headers_and_samples.py (unmasked, Excel-only).
 
 Generates dummy fixtures, runs the extractor as a subprocess, then verifies
 the export policy and every hardening fix:
@@ -7,18 +7,19 @@ the export policy and every hardening fix:
   1. exit code 0 even with control characters in the data (no late crash)
   2. no live formulas anywhere in the output (injection neutralized)
   3. sample rows per sheet <= MAX_SAMPLE_ROWS
-  4. masking: no full phone numbers / emails / GSTINs in sample values,
-     while pincodes stay readable
-  5. cp1252 CSV included (encoding fallback), noted in the report
+  4. values exported AS-IS: full phone numbers / emails / GSTINs present
+     unmodified (no masking)
+  5. cp1252 CSV included (encoding fallback), noted in the Report sheet
   6. .txt and ~$ lock files excluded
   7. headerless file flagged as header_detected=no
-  8. Index sheet lists exactly the sheets that exist
-  9. report CSV accounts for every input file
+  8. Index sheet lists exactly the preview sheets that exist
+  9. run accounting lives in the 'Report' sheet of part001 — no CSV files
+     are produced
 
 Usage: python tests/smoke_test.py
 """
 
-import csv
+import glob
 import os
 import shutil
 import subprocess
@@ -63,9 +64,10 @@ def main():
           f"exit={proc.returncode}")
 
     part1 = os.path.join(workdir, "preview_part001.xlsx")
-    report = os.path.join(workdir, "preview_report.csv")
     check("part file written", os.path.exists(part1))
-    check("report written", os.path.exists(report))
+    check("no CSV files produced",
+          not glob.glob(os.path.join(workdir, "*.csv")),
+          str(glob.glob(os.path.join(workdir, "*.csv"))))
     if FAILURES:
         finish(workdir)
 
@@ -81,12 +83,10 @@ def main():
           all(c.data_type != "f" for _, c in all_cells))
 
     text = " | ".join(str(c.value) for _, c in all_cells)
-    check("full mobile number masked", "9000000001" not in text)
-    check("masked form present", "90******01" in text)
-    check("full email masked", "owner1@example.com" not in text)
-    check("masked email present", "o***@example.com" in text)
-    check("full GSTIN masked", "27ABCDE1234F1Z5" not in text)
-    check("pincode still readable (not masked)", "400001" in text)
+    check("full mobile number exported as-is", "9000000001" in text)
+    check("full email exported as-is", "owner1@example.com" in text)
+    check("full GSTIN exported as-is", "27ABCDE1234F1Z5" in text)
+    check("pincode readable", "400001" in text)
     check("control character stripped, value kept", "hascontrol char" in text)
     check("injected formula stored as text",
           any("HYPERLINK" in str(c.value) and c.data_type != "f"
@@ -96,22 +96,24 @@ def main():
     # per-sheet checks
     sheets = set(wb.sheetnames)
     check("Index present", "Index" in sheets)
+    check("Report sheet present", "Report" in sheets)
     check("cp1252 CSV included", any("fx4_cp1252" in s for s in sheets))
     check("lock file not processed", not any("~$" in s for s in sheets))
 
     fx1 = next(s for s in sheets if "fx1_clean" in s)
     ws = wb[fx1]
-    # meta block: 1 header + 8 rows, then 1 column-header row, then samples
-    sample_rows = ws.max_row - (1 + 8 + 1)
+    # meta block: 1 header + 7 rows, then 1 column-header row, then samples
+    sample_rows = ws.max_row - (1 + 7 + 1)
     check("sample rows capped at 10", sample_rows == 10,
           f"got {sample_rows}")
 
     idx = wb["Index"]
     idx_rows = list(idx.iter_rows(min_row=2, values_only=True))
     listed = {r[0] for r in idx_rows}
-    check("Index lists exactly the sheets that exist",
-          listed == sheets - {"Index"},
-          f"listed-but-missing: {listed - sheets}, unlisted: {sheets - {'Index'} - listed}")
+    expected = sheets - {"Index", "Report"}
+    check("Index lists exactly the preview sheets that exist",
+          listed == expected,
+          f"listed-but-missing: {listed - sheets}, unlisted: {expected - listed}")
 
     by_file = {}
     for r in idx_rows:
@@ -124,15 +126,22 @@ def main():
     check("banner file header found at row 3",
           fx2_row is not None and fx2_row[4] == 3, f"row={fx2_row}")
 
-    with open(report, encoding="utf-8-sig") as f:
-        rows = list(csv.DictReader(f))
-    statuses = {r["file_path"]: r for r in rows}
-    check("report: txt skipped with reason",
-          any("fx7" in p and s["status"] == "skipped" for p, s in statuses.items()))
-    check("report: cp1252 encoding noted",
-          any("fx4" in p and "cp1252" in s["detail"] for p, s in statuses.items()))
-    check("report: no errors", all(r["status"] != "error" for r in rows),
-          str([r for r in rows if r["status"] == "error"]))
+    rep = wb["Report"]
+    rep_iter = rep.iter_rows(values_only=True)
+    rep_header = list(next(rep_iter))
+    rep_rows = [dict(zip(rep_header, r)) for r in rep_iter]
+    check("Report: txt skipped with reason",
+          any(r["file_path"] and "fx7" in r["file_path"]
+              and r["status"] == "skipped" for r in rep_rows))
+    check("Report: cp1252 encoding noted",
+          any(r["file_path"] and "fx4" in r["file_path"]
+              and r["detail"] and "cp1252" in r["detail"] for r in rep_rows))
+    check("Report: no errors",
+          all(r["status"] != "error" for r in rep_rows),
+          str([r for r in rep_rows if r["status"] == "error"]))
+    check("Report: every fixture accounted for",
+          all(any(r["file_path"] and fx in r["file_path"] for r in rep_rows)
+              for fx in ["fx1", "fx2", "fx3", "fx4", "fx5", "fx6", "fx7"]))
 
     finish(workdir)
 

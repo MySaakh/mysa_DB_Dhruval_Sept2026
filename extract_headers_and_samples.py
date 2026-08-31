@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
 """
-extract_headers_and_samples.py  (hardened)
-------------------------------------------
+extract_headers_and_samples.py  (hardened, unmasked)
+----------------------------------------------------
 Recursively scan a folder for Excel/CSV files, detect the header row,
 and write one output sheet per source sheet to multi-sheet Excel part
 files, each containing:
 
   - Metadata rows (file_path, file_name, sheet_name, header_row_no, ...)
   - Detected column headers
-  - Up to MAX_SAMPLE_ROWS sample data rows (sensitive values masked)
+  - Up to MAX_SAMPLE_ROWS sample data rows, exported exactly as they
+    appear in the source files (no masking)
 
 EXPORT POLICY — the only data this tool is allowed to move
 ==========================================================
   * Reads at most MAX_ROWS_READ_PER_SHEET (25) rows from any sheet.
   * Exports all column headers of a sheet, plus at most MAX_SAMPLE_ROWS
     (10) data rows per sheet.
-  * Sample values are MASKED by default: phone numbers / 8+ digit runs,
-    email addresses, GSTIN and PAN identifiers are partially redacted so
-    structure is visible but real contact data does not travel.
+  * Sample values are exported AS-IS (unmasked, by the data owner's
+    decision) — treat the output workbook as containing real lead data
+    and share it only with people who may see it.
   * Every value written to the output is sanitized: control characters
     are stripped and formula-leading characters (= + - @) are escaped,
     so the output workbook can never contain live formulas.
+  * All outputs are Excel files — no CSVs. The run accounting is a
+    "Report" sheet inside the first output part file.
   * The source files are opened read-only and never modified.
   * This script performs no network activity of any kind.
 
@@ -33,8 +36,6 @@ Usage:
 Options:
     --include-txt       also scan .txt files (excluded by default: notes
                         and readme files otherwise leak into the output)
-    --no-mask           disable masking of sample values (output will
-                        contain real phone numbers / emails)
     --overwrite         allow replacing existing output part files
     --sheets-per-file N start a new output part file every N sheets
                         (default 500; keeps workbooks openable and
@@ -42,10 +43,12 @@ Options:
     --limit N           process only the first N source files (test runs)
 
 Outputs (for output name "preview.xlsx"):
-    preview_part001.xlsx, preview_part002.xlsx, ...  one Index sheet +
-        preview sheets per part (Index reflects only what was written)
-    preview_report.csv   one row per source file/sheet: ok / skipped /
-        error with the reason — the complete accounting of the run
+    preview_part001.xlsx, preview_part002.xlsx, ...
+        One Index sheet per part (always the first tab, listing exactly
+        the sheets that were written) + one preview sheet per source
+        sheet. preview_part001.xlsx additionally carries the "Report"
+        sheet: one row per source file/sheet with ok / skipped / error
+        and the reason — the complete accounting of the run.
 """
 
 import argparse
@@ -92,7 +95,7 @@ CSV_ENCODINGS = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
 
 # ── Output sanitization ──────────────────────────────────────────────────────
 # Characters openpyxl refuses (control chars) — one of these anywhere in the
-# corpus crashed the previous version of this script at the final write.
+# corpus crashed the original version of this script at the final write.
 try:
     from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE  # type: ignore
 except Exception:  # pragma: no cover - fallback if openpyxl relocates it
@@ -116,40 +119,15 @@ def cell_str(v):
 
 
 def safe_cell(v, max_chars=MAX_SAMPLE_CELL_CHARS):
-    """Strip illegal characters and neutralize formula interpretation."""
+    """Strip illegal characters and neutralize formula interpretation.
+    This is corruption/injection protection, NOT masking — the value's
+    readable content is preserved."""
     s = cell_str(v)
     s = ILLEGAL_CHARACTERS_RE.sub("", s)
     if len(s) > max_chars:
         s = s[: max_chars - 1] + "…"
     if s.startswith(FORMULA_LEADERS):
         s = "'" + s  # stored as literal text, never as a formula
-    return s
-
-
-# ── Masking of sensitive sample values ───────────────────────────────────────
-EMAIL_RE = re.compile(
-    r"\b([A-Za-z0-9])[A-Za-z0-9._%+\-]*@([A-Za-z0-9.\-]+\.[A-Za-z]{2,})\b"
-)
-GSTIN_RE = re.compile(r"\b(\d{2})[0-9A-Za-z]{11}([0-9A-Za-z]{2})\b")
-PAN_RE = re.compile(r"\b([A-Za-z]{2})[A-Za-z]{3}\d{4}([A-Za-z])\b")
-PHONE_RE = re.compile(r"\+?\d[\d\-\s()]{5,}\d")
-
-
-def _mask_phone(match):
-    digits = re.sub(r"\D", "", match.group(0))
-    if len(digits) < 8:  # pincodes (6) and years (4) stay readable
-        return match.group(0)
-    return digits[:2] + "*" * (len(digits) - 4) + digits[-2:]
-
-
-def mask_value(s):
-    """Partially redact contact data / IDs; structure stays recognizable."""
-    if not s:
-        return s
-    s = EMAIL_RE.sub(r"\1***@\2", s)
-    s = GSTIN_RE.sub(r"\1***********\2", s)
-    s = PAN_RE.sub(r"\1***\2", s)
-    s = PHONE_RE.sub(_mask_phone, s)
     return s
 
 
@@ -231,9 +209,9 @@ def make_column_names(header_row):
     return col_names
 
 
-def build_sample_table(df_raw, hrow, mask):
+def build_sample_table(df_raw, hrow):
     """Return sample DataFrame: detected headers + up to MAX_SAMPLE_ROWS rows,
-    sanitized and (by default) masked."""
+    sanitized but otherwise exactly as found in the source."""
     col_names = make_column_names(df_raw.iloc[hrow].tolist())
 
     data_start = hrow + 1
@@ -245,10 +223,7 @@ def build_sample_table(df_raw, hrow, mask):
         sample = df_raw.iloc[data_start:data_end].copy()
         sample.columns = col_names
 
-    if mask:
-        sample = df_map(sample, lambda v: safe_cell(mask_value(cell_str(v))))
-    else:
-        sample = df_map(sample, safe_cell)
+    sample = df_map(sample, safe_cell)
 
     # POLICY enforcement: never export more sample rows than allowed.
     sample = sample.iloc[:MAX_SAMPLE_ROWS]
@@ -277,15 +252,19 @@ def sanitize_sheet_name(name, used_names):
 
 
 # ── File discovery ───────────────────────────────────────────────────────────
-def find_files(root_folder, include_txt, exclude_paths):
+def find_files(root_folder, include_txt, output_stem):
+    """Yield (filepath, ext). Skips hidden dirs/files, Excel lock files, and
+    this run's own output part files (in case output sits inside the scan
+    folder)."""
     active_exts = EXCEL_EXTS | CSV_EXTS | (TXT_EXTS if include_txt else set())
+    part_re = re.compile(re.escape(output_stem) + r"_part\d{3}\.xlsx$")
     for dirpath, dirnames, filenames in os.walk(root_folder):
         dirnames[:] = [d for d in dirnames if not d.startswith(".")]
         for fname in sorted(filenames):
             if fname.startswith(".") or fname.startswith("~$"):
                 continue
             filepath = os.path.join(dirpath, fname)
-            if os.path.abspath(filepath) in exclude_paths:
+            if part_re.search(os.path.abspath(filepath)):
                 continue
             ext = os.path.splitext(fname)[1].lower()
             if ext in active_exts:
@@ -321,7 +300,7 @@ def read_excel_preview(filepath, ext):
     return pd.read_excel(filepath, **kwargs)
 
 
-def extract_from_excel(filepath, ext, mask):
+def extract_from_excel(filepath, ext):
     all_sheets = read_excel_preview(filepath, ext)
     for sheet_name, df in all_sheets.items():
         # POLICY enforcement: defensive truncation on top of nrows.
@@ -330,12 +309,12 @@ def extract_from_excel(filepath, ext, mask):
         if df.empty:
             continue
         hrow, confident = find_header_row(df)
-        sample_df = build_sample_table(df, hrow, mask)
+        sample_df = build_sample_table(df, hrow)
         if sample_df.shape[1] > 0:
             yield sheet_name, hrow + 1, confident, sample_df, ""
 
 
-def extract_from_csv(filepath, ext, mask):
+def extract_from_csv(filepath, ext):
     sep = "\t" if ext == ".tsv" else ","
     try:
         with open(filepath, "r", encoding="utf-8", errors="replace") as f:
@@ -374,7 +353,7 @@ def extract_from_csv(filepath, ext, mask):
         return
 
     hrow, confident = find_header_row(df)
-    sample_df = build_sample_table(df, hrow, mask)
+    sample_df = build_sample_table(df, hrow)
     if sample_df.shape[1] > 0:
         note = f"encoding={used_encoding}" if used_encoding != "utf-8-sig" else ""
         yield "CSV", hrow + 1, confident, sample_df, note
@@ -386,9 +365,17 @@ INDEX_COLUMNS = [
     "header_row_no", "header_detected", "total_columns", "sample_rows", "note",
 ]
 
+REPORT_COLUMNS = [
+    "file_path", "sheet_name", "status", "detail", "output_file",
+    "output_sheet", "header_row_no", "header_detected",
+    "total_columns", "sample_rows",
+]
+
+RESERVED_SHEETS = {"Index", "Report"}
+
 
 def write_sheet_with_metadata(writer, sheet_name, meta, sample_df):
-    """Write metadata block, blank row, then header + sample data."""
+    """Write metadata block, then header + sample data."""
     meta_rows = [
         ["file_path", safe_cell(meta["file_path"])],
         ["file_name", safe_cell(meta["file_name"])],
@@ -397,7 +384,6 @@ def write_sheet_with_metadata(writer, sheet_name, meta, sample_df):
         ["header_detected", "yes" if meta["header_detected"] else "NO (best guess — row may be data)"],
         ["total_columns", meta["total_columns"]],
         ["sample_rows", meta["sample_rows"]],
-        ["values_masked", meta["values_masked"]],
     ]
 
     meta_df = pd.DataFrame(meta_rows, columns=["Field", "Value"])
@@ -449,8 +435,25 @@ def write_part(part_path, entries):
     return written
 
 
+def write_report_sheet(first_part_path, report_rows):
+    """Add the run accounting as a 'Report' sheet inside the first part file
+    (created standalone if no preview sheets were extracted at all)."""
+    report_df = pd.DataFrame(report_rows, columns=REPORT_COLUMNS)
+    if os.path.exists(first_part_path):
+        with pd.ExcelWriter(first_part_path, engine="openpyxl", mode="a") as writer:
+            report_df.to_excel(writer, sheet_name="Report", index=False)
+            try:
+                book = writer.book
+                book.move_sheet("Report", offset=-(len(book.sheetnames) - 2))
+            except Exception:
+                pass
+    else:
+        with pd.ExcelWriter(first_part_path, engine="openpyxl") as writer:
+            report_df.to_excel(writer, sheet_name="Report", index=False)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
-def run(folder, output_xlsx, include_txt=False, mask=True, overwrite=False,
+def run(folder, output_xlsx, include_txt=False, overwrite=False,
         sheets_per_file=500, limit=0):
     folder = os.path.abspath(folder)
     if not os.path.isdir(folder):
@@ -458,43 +461,39 @@ def run(folder, output_xlsx, include_txt=False, mask=True, overwrite=False,
 
     output_xlsx = os.path.abspath(output_xlsx)
     stem, _ = os.path.splitext(output_xlsx)
-    report_path = f"{stem}_report.csv"
 
     def part_path(n):
         return f"{stem}_part{n:03d}.xlsx"
 
-    if not overwrite and (os.path.exists(part_path(1)) or os.path.exists(report_path)):
+    if not overwrite and os.path.exists(part_path(1)):
         sys.exit(
-            f"ERROR: output already exists ({part_path(1)} / {report_path}). "
+            f"ERROR: output already exists ({part_path(1)}). "
             "Pass --overwrite to replace it."
         )
-
-    if not mask:
-        print("[NOTICE] --no-mask: sample values will contain REAL contact data.")
 
     missing = {}          # ext -> package, reported once
     part_entries = []
     part_no = 0
     parts_written = []
-    used_sheet_names = {"Index"}
+    used_sheet_names = set(RESERVED_SHEETS)
     counts = {"ok": 0, "skipped": 0, "error": 0}
-
-    report = open(report_path, "w", newline="", encoding="utf-8-sig")
-    report_writer = csv.writer(report)
-    report_writer.writerow(
-        ["file_path", "sheet_name", "status", "detail", "output_file",
-         "output_sheet", "header_row_no", "header_detected",
-         "total_columns", "sample_rows"]
-    )
+    report_rows = []
 
     def log(rel_path, sheet, status, detail="", out_file="", out_sheet="",
             hrow="", detected="", cols="", rows=""):
         counts[status] += 1
-        report_writer.writerow(
-            [rel_path, sheet, status, detail, out_file, out_sheet,
-             hrow, detected, cols, rows]
-        )
-        report.flush()
+        report_rows.append({
+            "file_path": safe_cell(rel_path),
+            "sheet_name": safe_cell(sheet),
+            "status": status,
+            "detail": safe_cell(detail),
+            "output_file": out_file,
+            "output_sheet": out_sheet,
+            "header_row_no": hrow,
+            "header_detected": detected,
+            "total_columns": cols,
+            "sample_rows": rows,
+        })
 
     def flush_part():
         nonlocal part_entries, part_no
@@ -518,15 +517,14 @@ def run(folder, output_xlsx, include_txt=False, mask=True, overwrite=False,
         print(f"  >> wrote {os.path.basename(path)} ({len(written)} sheets)")
         part_entries = []
 
-    exclude = {os.path.abspath(report_path)}
-    all_files = list(find_files(folder, include_txt, exclude))
+    all_files = list(find_files(folder, include_txt, stem))
     if limit:
         all_files = all_files[:limit]
     total = len(all_files)
     print(f"Scanning {total} file(s) under: {folder}")
     print(f"Policy: read <= {MAX_ROWS_READ_PER_SHEET} rows/sheet, export headers "
-          f"+ <= {MAX_SAMPLE_ROWS} sample rows/sheet, masking "
-          f"{'ON' if mask else 'OFF'}\n")
+          f"+ <= {MAX_SAMPLE_ROWS} sample rows/sheet, values exported AS-IS "
+          f"(no masking)\n")
 
     try:
         for i, (filepath, ext) in enumerate(all_files, 1):
@@ -552,9 +550,9 @@ def run(folder, output_xlsx, include_txt=False, mask=True, overwrite=False,
 
             try:
                 gen = (
-                    extract_from_excel(filepath, ext, mask)
+                    extract_from_excel(filepath, ext)
                     if ext in EXCEL_EXTS
-                    else extract_from_csv(filepath, ext, mask)
+                    else extract_from_csv(filepath, ext)
                 )
                 got_any = False
                 for sheet_name, header_row_no, confident, sample_df, note in gen:
@@ -573,7 +571,6 @@ def run(folder, output_xlsx, include_txt=False, mask=True, overwrite=False,
                             "header_detected": confident,
                             "total_columns": sample_df.shape[1],
                             "sample_rows": len(sample_df),
-                            "values_masked": "yes" if mask else "NO",
                             "note": note,
                         },
                     })
@@ -589,10 +586,14 @@ def run(folder, output_xlsx, include_txt=False, mask=True, overwrite=False,
             except Exception as e:
                 print(f"  [ERROR] {rel_path}: {e}")
                 log(rel_path, "", "error", str(e)[:300])
-
-        flush_part()
     finally:
-        report.close()
+        # Even on an interrupted run, flush collected sheets and write the
+        # accounting so the outputs on disk always explain themselves.
+        flush_part()
+        if report_rows:
+            write_report_sheet(part_path(1), report_rows)
+            if part_path(1) not in parts_written:
+                parts_written.insert(0, part_path(1))
 
     print(f"\nDone. sheets ok: {counts['ok']} | skipped: {counts['skipped']} "
           f"| errors: {counts['error']}")
@@ -600,14 +601,15 @@ def run(folder, output_xlsx, include_txt=False, mask=True, overwrite=False,
         print("Output files:")
         for p in parts_written:
             print(f"  {p}")
+        print(f"Run accounting: 'Report' sheet inside "
+              f"{os.path.basename(part_path(1))}")
     else:
-        print("No sheets extracted. Check folder path and file formats.")
-    print(f"Full accounting: {report_path}")
+        print("No files found. Check folder path and file formats.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract headers + masked sample rows from Excel/CSV files "
+        description="Extract headers + sample rows from Excel/CSV files "
                     "(see module docstring for the export policy)."
     )
     parser.add_argument("folder", help="root folder to scan")
@@ -616,8 +618,6 @@ def main():
                         help="output name; parts written as <name>_partNNN.xlsx")
     parser.add_argument("--include-txt", action="store_true",
                         help="also scan .txt files (off by default)")
-    parser.add_argument("--no-mask", action="store_true",
-                        help="do NOT mask phones/emails/IDs in sample values")
     parser.add_argument("--overwrite", action="store_true",
                         help="replace existing output files")
     parser.add_argument("--sheets-per-file", type=int, default=500,
@@ -628,7 +628,6 @@ def main():
 
     run(args.folder, args.output,
         include_txt=args.include_txt,
-        mask=not args.no_mask,
         overwrite=args.overwrite,
         sheets_per_file=max(1, args.sheets_per_file),
         limit=args.limit)
