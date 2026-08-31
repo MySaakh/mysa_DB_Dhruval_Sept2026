@@ -1,0 +1,8 @@
+# Core (required)
+pandas>=1.4
+openpyxl>=3.1
+
+# Optional readers — install these so those file types are not skipped
+xlrd>=2.0.1     # legacy .xls
+pyxlsb>=1.0.10  # binary .xlsb
+odfpy>=1.4      # OpenDocument .ods

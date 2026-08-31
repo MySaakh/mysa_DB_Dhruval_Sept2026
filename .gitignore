@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Generated outputs — never commit extracted data
+*_part[0-9][0-9][0-9].xlsx
+*_report.csv
+extracted_headers*.xlsx
+extracted_headers*.csv
+tests/fixtures/
