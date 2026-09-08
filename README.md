@@ -5,9 +5,13 @@ files, ~250 GB) before consolidating them into a single queryable database
 filterable by products, industry, location, area, city, pincode, business
 type, and business level.
 
-This repository currently contains **step 1**: a hardened structure-survey
-tool that inventories every sheet's column headers plus a small sample of
-its data — so the unified schema can be designed from evidence.
+The pipeline (all stages hardened and test-covered):
+
+1. `extract_headers_and_samples.py` — structure survey: headers + samples.
+2. `suggest_column_merges.py` — profiles column *values* and suggests which
+   raw columns mean the same canonical field.
+3. `merge_to_master.py` — pours row data into one master file using a
+   reviewed raw→canonical mapping.
 
 ## `extract_headers_and_samples.py`
 
@@ -108,10 +112,60 @@ docker run --rm --network none \
 With `--network none` and `:ro`, exfiltration and source modification are
 impossible regardless of what any script does.
 
+## `suggest_column_merges.py` (stage 2)
+
+Scans a folder (raw files or preview workbooks), reads at most ~21 rows per
+sheet, and classifies every raw column by its actual values (emails, phones,
+URLs, pincodes, addresses, company suffixes, person names with Indian
+honorifics) combined with header-name hints. Handles the ambiguous bare
+`Name` column per sheet. Output workbook: `Merge_Sheet_Suggestion`,
+`Column_Samples` (the mapping input for stage 3 — **review this by hand
+before merging**), `Per_Sheet_Mapping`, `Column_Profiles`,
+`Ambiguous_Name_Like`, `Skipped_Files` (every unreadable file/sheet with
+the reason), `Run_Summary`.
+
+```bash
+python suggest_column_merges.py "/path/to/Category-1" \
+    --output "Category-1/column_merge_suggestions.xlsx" --overwrite
+```
+
+Hardened: all output cells sanitized (no formula injection, no
+control-character crash), CSV encoding fallback, failures recorded in the
+workbook instead of console-only.
+
+## `merge_to_master.py` (stage 3)
+
+Ingests **all rows** of the input files and merges them into one master
+table using the reviewed mapping. The mapping is a **column allowlist**:
+only mapped columns' data enters the master; unmapped columns are listed by
+name only in `Unmapped_Headers`. Same-row rule for multiple columns mapping
+to one field: first non-empty wins, case-insensitive duplicates dropped,
+different values joined with `" | "`. Rows are never merged across files.
+
+```bash
+python merge_to_master.py --input "/path/to/Category-1" \
+    --mapping "Category-1/column_merge_suggestions.xlsx" \
+    --output "Category-1/category1_master_merged.xlsx" \
+    --include-source --overwrite
+```
+
+Hardened: every output sheet sanitized, CSV encoding fallback, every failed
+file/sheet logged in `Ingest_Log` with `status=error`, the Excel row limit
+(1,048,576/sheet) guarded by splitting into `Master`, `Master_2`, …,
+preview `*_partNNN.xlsx` files skipped by default (`--include-previews` to
+ingest them), and the output + mapping files excluded from ingestion.
+
+Operational notes: run per category (everything is held in RAM before the
+final write); after each run review `Ingest_Log` rows with
+`status=skipped/error` and the `Unmapped_Headers` sheet — that is your
+completeness check. A `.csv` output writes the accounting to
+`<output>_ingest_log.xlsx` alongside it.
+
 ### Tests
 
 ```bash
-python tests/smoke_test.py
+python tests/smoke_test.py            # stage 1 (extractor)
+python tests/pipeline_smoke_test.py   # stages 2-3 (suggest + merge)
 ```
 
 Generates synthetic dummy files (banner rows, headerless data, cp1252
@@ -124,12 +178,10 @@ that no CSV files are produced. The run must end with "All checks passed."
 
 1. **Done — structure survey** (this tool): know every header variant and
    see samples of what columns actually contain.
-2. **Next — canonical schema**: map raw header variants onto canonical
-   fields (company, owner, mobile, email, address, area, city, district,
-   state, country, pincode, products, industry, business type, business
-   level, turnover, …) using the survey output as evidence.
-3. **Then — consolidation ETL**: stream all 5,500 files into a single
-   indexed database (one normalized `leads` table + source lineage), with
-   dedupe and cleaning.
-4. **Finally — query layer**: filtered extraction for sales/marketing
-   campaigns across the eight target filter dimensions.
+2. **In repo — canonical schema tooling**: `suggest_column_merges.py` proposes
+   the raw→canonical mapping from data evidence; you review and edit it.
+3. **In repo — consolidation (v1)**: `merge_to_master.py` merges mapped
+   columns into per-category master files with full accounting.
+4. **Next — database + query layer**: load the per-category masters into an
+   indexed database with dedupe, then filtered extraction for campaigns
+   across the eight target filter dimensions.
